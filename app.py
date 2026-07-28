@@ -5,12 +5,29 @@ import numpy as np
 import re
 import easyocr
 
-st.set_page_config(page_title="PL1 VIN Scanner & Comparator", layout="centered")
+# 1. Set Wide Page Layout
+st.set_page_config(page_title="PL1 VIN Scanner", layout="wide")
 
-# Hide Streamlit Cloud throttling banner
+# 2. Inject CSS for Widescreen Camera Viewport & Hide Throttling Banner
 st.markdown("""
     <style>
     div[data-testid="stNotification"] { display: none !important; }
+    
+    /* Make camera input and video containers take full width */
+    div[data-testid="stCameraInput"] {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+    div[data-testid="stCameraInput"] video {
+        width: 100% !important;
+        border-radius: 10px;
+        border: 3px solid #00FF00;
+    }
+    .block-container {
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+        max-width: 100% !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -26,114 +43,106 @@ if 'checksheet_vin' not in st.session_state:
 if 'car_vin' not in st.session_state:
     st.session_state.car_vin = ""
 
-def process_vin_image(pil_image):
-    """Preprocesses snapshot image and extracts PL1 VIN."""
-    # Convert PIL Image to OpenCV Format
+def extract_strict_pl1_vin(pil_image):
+    """Processes image and forcibly extracts/formats a PL1-prefixed 17-char VIN."""
     img = np.array(pil_image.convert('RGB'))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    # 1. Image Enhancement (Contrast Boost + Gaussian Blur)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    
-    # Adaptive thresholding to isolate black text on white/metal background
+    # Upscale & Threshold for Contrast
+    resized = cv2.resize(gray, (0, 0), fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
     thresh = cv2.adaptiveThreshold(
         blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
         cv2.THRESH_BINARY, 11, 2
     )
 
-    # 2. Run EasyOCR on processed crisp image
+    # OCR Extraction
     results = reader.readtext(thresh, detail=0)
     raw_text = "".join(results).upper()
-    
-    # Display raw extraction in UI for debugging
-    st.write(f"🔍 **Raw Detected Text:** `{raw_text if raw_text else 'None'}`")
-
-    # Clean characters (alphanumeric only)
     cleaned = re.sub(r'[^A-Z0-9]', '', raw_text)
 
     if not cleaned:
         return None
 
-    # Force correct PL1 prefix if OCR mistook 1 for I, L, or P11/RL1
-    if len(cleaned) >= 3:
-        prefix = cleaned[:3]
-        if prefix in ["PLI", "PLL", "P11", "RL1", "FL1", "PL1"]:
-            cleaned = "PL1" + cleaned[3:]
-
-    # Map illegal VIN characters (I -> 1, O/Q -> 0)
-    corrected = []
-    for char in cleaned:
-        if char == 'I':
-            corrected.append('1')
-        elif char in ['O', 'Q']:
-            corrected.append('0')
+    # Step A: Search for PL1 (or common OCR corruption: PLI, PLL, P11, RL1) + 14 chars
+    pl1_match = re.search(r'(PL1|PLI|PLL|P11|P1I|RL1|FL1)[A-Z0-9]{14}', cleaned)
+    
+    if pl1_match:
+        found_str = pl1_match.group(0)
+        suffix = found_str[3:]  # Extract remaining 14 characters
+    else:
+        # Step B: Hard Fallback - Find any 14 to 17 character string
+        long_matches = re.findall(r'[A-Z0-9]{14,17}', cleaned)
+        if long_matches:
+            target = long_matches[0]
+            suffix = target[3:17] if len(target) >= 17 else target[:14]
         else:
-            corrected.append(char)
-    corrected_str = "".join(corrected)
+            # Step C: Fallback for short/partial OCR reads
+            suffix = cleaned[:14]
 
-    # Search for explicit 17-char PL1 string
-    pl1_matches = re.findall(r'PL1[A-HJ-NPR-Z0-9]{14}', corrected_str)
-    if pl1_matches:
-        return pl1_matches[0]
+    # Clean the 14-char suffix (replace invalid VIN chars: I->1, O/Q->0)
+    corrected_suffix = []
+    for char in suffix:
+        if char == 'I':
+            corrected_suffix.append('1')
+        elif char in ['O', 'Q']:
+            corrected_suffix.append('0')
+        else:
+            corrected_suffix.append(char)
+            
+    final_suffix = "".join(corrected_suffix)
 
-    # Search for generic 17-char VIN string
-    vin_matches = re.findall(r'[A-HJ-NPR-Z0-9]{17}', corrected_str)
-    if vin_matches:
-        return vin_matches[0]
-
-    # Fallback to 10+ characters
-    return corrected_str[:17] if len(corrected_str) >= 10 else None
-
-# UI Header
-st.title("🚗 VIN Comparison Tool")
-st.write("Take a crisp, close-up photo of the VIN sticker or checksheet.")
-
-tabs = st.tabs(["1️⃣ Scan Checksheet", "2️⃣ Scan Car VIN"])
-
-# ----------------- TAB 1: Checksheet -----------------
-with tabs[0]:
-    st.subheader("Step 1: Checksheet VIN")
-    checksheet_file = st.camera_input("Capture Checksheet VIN", key="cam_sheet")
+    # ALWAYS FORCIBLY PREPEND PL1
+    final_vin = f"PL1{final_suffix}"
     
-    if checksheet_file:
-        img = Image.open(checksheet_file)
-        with st.spinner("Processing VIN..."):
-            extracted = process_vin_image(img)
-            if extracted:
-                st.session_state.checksheet_vin = extracted
-                st.success(f"Captured Checksheet VIN: `{extracted}`")
-            else:
-                st.error("Could not read a valid VIN. Please retake photo closer to text.")
+    # Trim to exactly 17 characters
+    return final_vin[:17]
 
-# ----------------- TAB 2: Car VIN -----------------
-with tabs[1]:
-    st.subheader("Step 2: Car VIN")
-    car_file = st.camera_input("Capture Car VIN (Door Jamb / Plate)", key="cam_car")
-    
+# Title Banner
+st.title("🚗 PL1 VIN Matcher & Inspector")
+st.caption("Widescreen camera enabled. All readings are strictly enforced to start with **PL1**.")
+
+# Widescreen Layout Columns
+col_scan1, col_scan2 = st.columns(2)
+
+with col_scan1:
+    st.subheader("1️⃣ Checksheet VIN")
+    sheet_file = st.camera_input("Capture Checksheet", key="cam_sheet")
+    if sheet_file:
+        img = Image.open(sheet_file)
+        with st.spinner("Processing..."):
+            res = extract_strict_pl1_vin(img)
+            if res:
+                st.session_state.checksheet_vin = res
+
+with col_scan2:
+    st.subheader("2️⃣ Car VIN")
+    car_file = st.camera_input("Capture Car VIN", key="cam_car")
     if car_file:
         img = Image.open(car_file)
-        with st.spinner("Processing VIN..."):
-            extracted = process_vin_image(img)
-            if extracted:
-                st.session_state.car_vin = extracted
-                st.success(f"Captured Car VIN: `{extracted}`")
-            else:
-                st.error("Could not read a valid VIN. Please retake photo closer to text.")
+        with st.spinner("Processing..."):
+            res = extract_strict_pl1_vin(img)
+            if res:
+                st.session_state.car_vin = res
 
 st.divider()
 
-# ----------------- Comparison Section -----------------
-col1, col2 = st.columns(2)
-with col1:
+# Result Comparison View
+col_input1, col_input2 = st.columns(2)
+
+with col_input1:
     st.session_state.checksheet_vin = st.text_input(
-        "Checksheet VIN:", value=st.session_state.checksheet_vin
+        "Checksheet VIN Result:", 
+        value=st.session_state.checksheet_vin
     ).upper()
 
-with col2:
+with col_input2:
     st.session_state.car_vin = st.text_input(
-        "Car VIN:", value=st.session_state.car_vin
+        "Car VIN Result:", 
+        value=st.session_state.car_vin
     ).upper()
 
+# Validation Banner
 if st.session_state.checksheet_vin and st.session_state.car_vin:
     chk = st.session_state.checksheet_vin.strip()
     car = st.session_state.car_vin.strip()
