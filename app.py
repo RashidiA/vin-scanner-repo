@@ -1,154 +1,121 @@
-import streamlit as st
-from PIL import Image
 import cv2
-import numpy as np
 import re
+import numpy as np
+import av
 import easyocr
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 
-# 1. Set Wide Page Layout
-st.set_page_config(page_title="PL1 VIN Scanner", layout="wide")
+# -------------------------------------------------------------------
+# 1. VIN VALIDATION UTILITIES
+# -------------------------------------------------------------------
+# VINs never contain I, O, or Q. Total length must be 17 characters.
+VIN_PATTERN = re.compile(r'^[A-HJ-NPR-Z0-9]{17}$')
 
-# 2. Inject CSS for Widescreen Camera Viewport & Hide Throttling Banner
-st.markdown("""
-    <style>
-    div[data-testid="stNotification"] { display: none !important; }
+# ISO 3779 VIN Checksum verification weights & transliteration table
+VIN_WEIGHTS = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
+VIN_TRANSLITERATION = {
+    'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6, 'G': 7, 'H': 8,
+    'J': 1, 'K': 2, 'L': 3, 'M': 4, 'N': 5, 'P': 7, 'R': 9,
+    'S': 2, 'T': 3, 'U': 4, 'V': 5, 'W': 6, 'X': 7, 'Y': 8, 'Z': 9,
+    '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9
+}
+
+def is_valid_vin(vin: str) -> bool:
+    """Verifies format and mathematical checksum (9th digit) of a VIN."""
+    vin = vin.upper().strip()
+    if not VIN_PATTERN.match(vin):
+        return False
     
-    /* Make camera input and video containers take full width */
-    div[data-testid="stCameraInput"] {
-        width: 100% !important;
-        max-width: 100% !important;
-    }
-    div[data-testid="stCameraInput"] video {
-        width: 100% !important;
-        border-radius: 10px;
-        border: 3px solid #00FF00;
-    }
-    .block-container {
-        padding-left: 2rem !important;
-        padding-right: 2rem !important;
-        max-width: 100% !important;
-    }
-    </style>
-""", unsafe_allow_html=True)
+    # Calculate checksum
+    total = sum(VIN_TRANSLITERATION[char] * VIN_WEIGHTS[idx] for idx, char in enumerate(vin))
+    remainder = total % 11
+    expected_check = 'X' if remainder == 10 else str(remainder)
+    
+    return vin[8] == expected_check
 
+# -------------------------------------------------------------------
+# 2. MODEL INITIALIZATION (Cached for performance)
+# -------------------------------------------------------------------
 @st.cache_resource
-def load_ocr():
+def load_ocr_reader():
+    # Load EasyOCR for English character detection
     return easyocr.Reader(['en'], gpu=False)
 
-reader = load_ocr()
+reader = load_ocr_reader()
 
-# Initialize Session State
-if 'checksheet_vin' not in st.session_state:
-    st.session_state.checksheet_vin = ""
-if 'car_vin' not in st.session_state:
-    st.session_state.car_vin = ""
+# -------------------------------------------------------------------
+# 3. WEBRTC FRAME PROCESSOR (AR OVERLAY ENGINE)
+# -------------------------------------------------------------------
+class VINScannerProcessor:
+    def __init__(self):
+        self.frame_count = 0
+        self.last_detected_vin = ""
 
-def extract_strict_pl1_vin(pil_image):
-    """Processes image and forcibly extracts/formats a PL1-prefixed 17-char VIN."""
-    img = np.array(pil_image.convert('RGB'))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    # Upscale & Threshold for Contrast
-    resized = cv2.resize(gray, (0, 0), fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    blurred = cv2.GaussianBlur(resized, (3, 3), 0)
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 11, 2
-    )
-
-    # OCR Extraction
-    results = reader.readtext(thresh, detail=0)
-    raw_text = "".join(results).upper()
-    cleaned = re.sub(r'[^A-Z0-9]', '', raw_text)
-
-    if not cleaned:
-        return None
-
-    # Step A: Search for PL1 (or common OCR corruption: PLI, PLL, P11, RL1) + 14 chars
-    pl1_match = re.search(r'(PL1|PLI|PLL|P11|P1I|RL1|FL1)[A-Z0-9]{14}', cleaned)
-    
-    if pl1_match:
-        found_str = pl1_match.group(0)
-        suffix = found_str[3:]  # Extract remaining 14 characters
-    else:
-        # Step B: Hard Fallback - Find any 14 to 17 character string
-        long_matches = re.findall(r'[A-Z0-9]{14,17}', cleaned)
-        if long_matches:
-            target = long_matches[0]
-            suffix = target[3:17] if len(target) >= 17 else target[:14]
-        else:
-            # Step C: Fallback for short/partial OCR reads
-            suffix = cleaned[:14]
-
-    # Clean the 14-char suffix (replace invalid VIN chars: I->1, O/Q->0)
-    corrected_suffix = []
-    for char in suffix:
-        if char == 'I':
-            corrected_suffix.append('1')
-        elif char in ['O', 'Q']:
-            corrected_suffix.append('0')
-        else:
-            corrected_suffix.append(char)
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        self.frame_count += 1
+        
+        # Performance optimization: Process OCR every 5th frame to avoid video lag
+        if self.frame_count % 5 == 0:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
-    final_suffix = "".join(corrected_suffix)
+            # Restrict allowlist strictly to non-ambiguous VIN characters
+            results = reader.readtext(
+                gray, 
+                allowlist='ABCDEFGHJKLMNPRSTUVWXYZ0123456789',
+                paragraph=False
+            )
+            
+            for (bbox, text, prob) in results:
+                cleaned_text = re.sub(r'[^A-Z0-9]', '', text.upper())
+                
+                if len(cleaned_text) >= 17:
+                    possible_vin = cleaned_text[:17]
+                    pts = np.array(bbox, np.int32).reshape((-1, 1, 2))
+                    
+                    if is_valid_vin(possible_vin):
+                        color = (0, 255, 0)  # Green for verified valid VIN
+                        label = f"VALID VIN: {possible_vin}"
+                        self.last_detected_vin = possible_vin
+                    else:
+                        color = (0, 165, 255)  # Orange for format match with invalid checksum
+                        label = f"RAW VIN: {possible_vin}"
 
-    # ALWAYS FORCIBLY PREPEND PL1
-    final_vin = f"PL1{final_suffix}"
-    
-    # Trim to exactly 17 characters
-    return final_vin[:17]
+                    # Draw AR Bounding Box & Text Overlay onto live camera stream
+                    cv2.polylines(img, [pts], True, color, 3)
+                    cv2.putText(img, label, (pts[0][0][0], max(30, pts[0][0][1] - 10)), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-# Title Banner
-st.title("🚗 PL1 VIN Matcher & Inspector")
-st.caption("Widescreen camera enabled. All readings are strictly enforced to start with **PL1**.")
+        # Persistent HUD banner on top of the stream displaying the last read VIN
+        if self.last_detected_vin:
+            cv2.rectangle(img, (20, 20), (450, 70), (0, 0, 0), -1)
+            cv2.putText(img, f"DETECTED: {self.last_detected_vin}", (30, 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-# Widescreen Layout Columns
-col_scan1, col_scan2 = st.columns(2)
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-with col_scan1:
-    st.subheader("1️⃣ Checksheet VIN")
-    sheet_file = st.camera_input("Capture Checksheet", key="cam_sheet")
-    if sheet_file:
-        img = Image.open(sheet_file)
-        with st.spinner("Processing..."):
-            res = extract_strict_pl1_vin(img)
-            if res:
-                st.session_state.checksheet_vin = res
+# -------------------------------------------------------------------
+# 4. STREAMLIT UI SETUP
+# -------------------------------------------------------------------
+st.set_page_config(page_title="Real-time VIN AR Scanner", layout="centered")
 
-with col_scan2:
-    st.subheader("2️⃣ Car VIN")
-    car_file = st.camera_input("Capture Car VIN", key="cam_car")
-    if car_file:
-        img = Image.open(car_file)
-        with st.spinner("Processing..."):
-            res = extract_strict_pl1_vin(img)
-            if res:
-                st.session_state.car_vin = res
+st.title("🚗 Real-time VIN Scanner")
+st.markdown("Point your camera at a vehicle door jamb sticker, dashboard plate, or window etching.")
 
-st.divider()
+# STUN server configuration for cross-network WebRTC streaming
+rtc_config = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 
-# Result Comparison View
-col_input1, col_input2 = st.columns(2)
+webrtc_streamer(
+    key="vin-ar-scanner",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=rtc_config,
+    video_processor_factory=VINScannerProcessor,
+    media_stream_constraints={
+        "video": {"facingMode": "environment"},  # Defaults to rear camera on mobile phones
+        "audio": False
+    },
+    async_processing=True,
+)
 
-with col_input1:
-    st.session_state.checksheet_vin = st.text_input(
-        "Checksheet VIN Result:", 
-        value=st.session_state.checksheet_vin
-    ).upper()
-
-with col_input2:
-    st.session_state.car_vin = st.text_input(
-        "Car VIN Result:", 
-        value=st.session_state.car_vin
-    ).upper()
-
-# Validation Banner
-if st.session_state.checksheet_vin and st.session_state.car_vin:
-    chk = st.session_state.checksheet_vin.strip()
-    car = st.session_state.car_vin.strip()
-
-    if chk == car:
-        st.balloons()
-        st.success(f"✅ MATCH CONFIRMED!\n\n`{chk}`")
-    else:
-        st.error(f"❌ MISMATCH DETECTED!\n\nChecksheet: `{chk}`\nCar VIN: `{car}`")
+st.info("Tip: Keep camera steady about 6–12 inches away from the VIN plate under clean lighting.")
