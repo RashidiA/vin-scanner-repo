@@ -8,7 +8,7 @@ from streamlit_webrtc import VideoHTMLAttributes, WebRtcMode, webrtc_streamer
 
 st.set_page_config(page_title="PL1 VIN Scanner & Comparator", layout="centered")
 
-# Hide Streamlit throttling banner if present
+# Hide Streamlit throttling banner
 st.markdown(
     """
     <style>
@@ -25,7 +25,7 @@ def load_ocr():
 
 reader = load_ocr()
 
-# 2. Cache thread-safe Queues
+# 2. Thread-safe Queues
 @st.cache_resource
 def get_result_queue():
     return queue.Queue()
@@ -43,61 +43,61 @@ if "checksheet_vin" not in st.session_state:
 if "car_vin" not in st.session_state:
     st.session_state.car_vin = ""
 if "last_raw_ocr" not in st.session_state:
-    st.session_state.last_raw_ocr = "Waiting for video feed..."
+    st.session_state.last_raw_ocr = "Waiting for active camera feed..."
 
-def clean_and_extract_vin(image_crop):
-    """Upscales crop, maps OCR errors for PL1 VINs, and extracts 17 chars."""
+def preprocess_and_ocr(image_crop):
+    """Applies Otsu binarization and extracts PL1 VIN text."""
+    # Convert to grayscale
     gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
 
-    # Upscale 2x for OCR clarity
+    # Upscale 2x for character resolution
     h, w = gray.shape
     resized = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
 
-    # Run EasyOCR (allow upper letters + numbers)
-    results = reader.readtext(resized, detail=0)
+    # Contrast enhancement + Otsu Thresholding (Binarization)
+    blurred = cv2.GaussianBlur(resized, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Run OCR on thresholded image
+    results = reader.readtext(thresh, detail=0)
     raw_text = "".join(results).upper()
     
-    # Store for live UI debugging
+    # Send raw output to debug log
     if debug_queue.empty():
-        debug_queue.put(raw_text)
+        debug_queue.put(raw_text if raw_text else "[No text detected in crop box]")
 
-    # Clean to alphanumeric only (KEEP 'I', 'O', 'Q' initially so we can correct them)
-    cleaned_alpha = re.sub(r"[^A-Z0-9]", "", raw_text)
-
-    if not cleaned_alpha:
+    # Filter alphanumeric
+    cleaned = re.sub(r"[^A-Z0-9]", "", raw_text)
+    if not cleaned:
         return None
 
-    # --- SPECIFIC PL1 PREFIX CORRECTION ---
-    # Fix common OCR misreads of "PL1" (e.g., PLI, PLL, P11, RL1, FL1)
-    if len(cleaned_alpha) >= 3:
-        prefix = cleaned_alpha[:3]
-        if prefix in ["PLI", "PLL", "P11", "RL1", "FL1", "PL1"]:
-            cleaned_alpha = "PL1" + cleaned_alpha[3:]
+    # Handle PL1 OCR confusion (PLI, PLL, P11 -> PL1)
+    if len(cleaned) >= 3:
+        if cleaned[:3] in ["PLI", "PLL", "P11", "RL1", "FL1"]:
+            cleaned = "PL1" + cleaned[3:]
 
-    # --- STANDARD VIN CHARACTER REPLACEMENT ---
-    # Replace illegal VIN characters: I -> 1, O -> 0, Q -> 0
+    # Map invalid VIN characters
     corrected = []
-    for char in cleaned_alpha:
-        if char == "I":
+    for c in cleaned:
+        if c == "I":
             corrected.append("1")
-        elif char in ["O", "Q"]:
+        elif c in ["O", "Q"]:
             corrected.append("0")
         else:
-            corrected.append(char)
-            
+            corrected.append(c)
     corrected_str = "".join(corrected)
 
-    # 1. Look for explicit 17-character PL1 VIN pattern
+    # Search for PL1 17-char match
     pl1_matches = re.findall(r"PL1[A-HJ-NPR-Z0-9]{14}", corrected_str)
     if pl1_matches:
         return pl1_matches[0]
 
-    # 2. Look for any 17-character valid VIN pattern
+    # Search for standard 17-char VIN
     vin_matches = re.findall(r"[A-HJ-NPR-Z0-9]{17}", corrected_str)
     if vin_matches:
         return vin_matches[0]
 
-    # 3. Fallback: If 10+ chars detected, pass best effort for manual correction
+    # Fallback to partial capture if length >= 10
     if len(corrected_str) >= 10:
         return corrected_str[:17]
 
@@ -107,7 +107,7 @@ st.title("🚗 VIN Comparison Tool")
 st.write("Align the **PL1** VIN inside the green bounding box.")
 
 mode = st.radio(
-    "Scanning target:", ["1️⃣ Checksheet VIN", "2️⃣ Car VIN"], horizontal=True
+    "Target to Scan:", ["1️⃣ Checksheet VIN", "2️⃣ Car VIN"], horizontal=True
 )
 
 # Video Callback Processor
@@ -115,29 +115,35 @@ class VINVideoProcessor:
     def __init__(self, res_queue):
         self.res_queue = res_queue
         self.frame_count = 0
+        self.status = "CAMERA ACTIVE"
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
         h, w, _ = img.shape
 
-        # Broad Target ROI Box (85% width, 35% height)
-        box_w, box_h = int(w * 0.85), int(h * 0.35)
+        # Define Target ROI Box (85% width, 30% height)
+        box_w, box_h = int(w * 0.85), int(h * 0.3)
         x1, y1 = int((w - box_w) / 2), int((h - box_h) / 2)
         x2, y2 = x1 + box_w, y1 + box_h
 
-        # Throttle: Evaluate 1 frame every 10 frames (~0.3s)
+        # Send frame to queue every 12 frames (~0.4s)
         self.frame_count += 1
-        if self.frame_count % 10 == 0:
+        if self.frame_count % 12 == 0:
+            self.status = "READING FRAME..."
             crop = img[y1:y2, x1:x2].copy()
             if self.res_queue.empty():
                 self.res_queue.put(crop)
+        else:
+            self.status = "SCANNING..."
 
-        # Draw Guidance Box
+        # Draw Target Box
         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        
+        # Overlay Live Status Banner on Top of Stream
         cv2.putText(
             img,
-            "ALIGN PL1 VIN HERE",
-            (x1 + 10, y1 - 10),
+            f"STATUS: {self.status}",
+            (x1, y1 - 15),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 255, 0),
@@ -146,9 +152,9 @@ class VINVideoProcessor:
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# WebRTC Streamer
+# Streamer
 webrtc_ctx = webrtc_streamer(
-    key="vin-scanner-pl1",
+    key="vin-scanner-status",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=lambda: VINVideoProcessor(result_queue),
     media_stream_constraints={
@@ -170,10 +176,10 @@ webrtc_ctx = webrtc_streamer(
     ),
 )
 
-# Process queued frame
+# Handle Queued Crop Frame
 if not result_queue.empty():
     cropped_frame = result_queue.get()
-    detected_vin = clean_and_extract_vin(cropped_frame)
+    detected_vin = preprocess_and_ocr(cropped_frame)
 
     if detected_vin:
         if mode == "1️⃣ Checksheet VIN":
@@ -182,15 +188,16 @@ if not result_queue.empty():
             st.session_state.car_vin = detected_vin
         st.rerun()
 
-# Display Live OCR Debug Feed
+# Display Debug Output
 if not debug_queue.empty():
     st.session_state.last_raw_ocr = debug_queue.get()
 
-st.caption(f"🔍 **Live Camera OCR Feed:** `{st.session_state.last_raw_ocr}`")
+# Status Banner
+st.info(f"📡 **Live OCR Raw Reading:** `{st.session_state.last_raw_ocr}`")
 
 st.divider()
 
-# Interactive Form & Manual Overrides
+# Inputs & Matching Logic
 col1, col2 = st.columns(2)
 with col1:
     st.session_state.checksheet_vin = st.text_input(
@@ -202,7 +209,6 @@ with col2:
         "Car VIN:", value=st.session_state.car_vin
     ).upper()
 
-# Verification Check
 if st.session_state.checksheet_vin and st.session_state.car_vin:
     chk = st.session_state.checksheet_vin.strip()
     car = st.session_state.car_vin.strip()
