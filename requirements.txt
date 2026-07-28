@@ -1,11 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-
-streamlit>=1.25.0
-streamlit-webrtc>=0.45.0
+streamlit
 opencv-python-headless
-easyocr>=1.7.0
-numpy<2.0.0
-av
-torch==2.2.2
-torchvision==0.17.2
-pytesseract
+pillow
+rapidocr-onnxruntime
